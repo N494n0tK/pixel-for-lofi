@@ -1194,17 +1194,11 @@
   }
 
   // ------------------------------------------------------------ layout
-  // iPhone のホーム画面アプリ（ステータスバー透過）では、画面の高さが
-  // ステータスバーの分だけ短く報告され、下にすき間ができることがある。
-  // そのときは実際の画面サイズに合わせて表示領域を広げる。
+  // 表示領域のサイズ。iPhone のホーム画面アプリでは、ステータスバーを透過させると
+  // 高さが正しく報告されず下にすき間ができるため、ステータスバーは透過させていない
+  // （index.html の apple-mobile-web-app-status-bar-style）。
   function viewportSize() {
-    let w = stage.clientWidth, h = stage.clientHeight;
-    h = Math.max(h, window.innerHeight || 0);
-    if (navigator.standalone === true && h > w) {
-      const sh = Math.max(screen.width, screen.height), sw = Math.min(screen.width, screen.height);
-      if (sh > h && sh - h < 120) h = sh;
-      if (sw > w && sw - w < 40) w = sw;
-    }
+    const w = stage.clientWidth, h = Math.max(stage.clientHeight, window.innerHeight || 0);
     stage.style.width = w + 'px';
     stage.style.height = h + 'px';
     return [w, h];
