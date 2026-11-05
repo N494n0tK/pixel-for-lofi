@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<title>雪の夜の窓</title>
+<meta name="description" content="窓から雪の降る夜の街をながめるピクセルアートアニメーション">
+<meta name="theme-color" content="#070816">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="雪の窓">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<link rel="icon" type="image/png" href="icons/icon-192.png">
+<style>
+  :root {
+    --bg: #05060c;
+    --frame: #12131f;
+    --panel: rgba(12, 12, 28, 0.86);
+    --text: #ece8f6;
+    --muted: #9b97b9;
+    --accent: #ffcf7a;
+    --line: rgba(255, 255, 255, 0.12);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) { --bg: #05060c; }
+  }
+  :root[data-theme="dark"] { --bg: #05060c; }
+
+  html, body {
+    margin: 0; height: 100%; overflow: hidden;
+    background: var(--bg); color: var(--text);
+    font-family: system-ui, -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif;
+    -webkit-user-select: none; user-select: none;
+    -webkit-tap-highlight-color: transparent;
+    -webkit-touch-callout: none;
+    touch-action: manipulation;
+  }
+  #stage { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; }
+  #screen { position: relative; overflow: hidden; background: #070816; }
+  #screen.phone {
+    border-radius: 36px;
+    box-shadow: 0 0 0 9px var(--frame), 0 0 0 10px #2a2d42, 0 30px 90px rgba(0, 0, 0, 0.7);
+  }
+  #cv {
+    position: absolute; display: block;
+    image-rendering: pixelated; image-rendering: crisp-edges;
+  }
+
+  /* ---- UI ---- */
+  #hint {
+    position: absolute; left: 50%; bottom: calc(22px + env(safe-area-inset-bottom));
+    transform: translateX(-50%);
+    font-size: 12px; letter-spacing: .12em; color: var(--muted);
+    background: rgba(0, 0, 0, .35); padding: 6px 12px; border-radius: 99px;
+    pointer-events: none; transition: opacity 1.2s ease; white-space: nowrap;
+  }
+  #hint.gone { opacity: 0; }
+
+  #ui {
+    position: absolute; left: 12px; right: 12px;
+    bottom: calc(12px + env(safe-area-inset-bottom));
+    max-width: 380px; margin: 0 auto;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 18px;
+    padding: 14px 14px 12px;
+    -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px);
+    transition: opacity .25s ease, transform .25s ease;
+  }
+  #ui.hidden { opacity: 0; transform: translateY(12px); pointer-events: none; }
+  #ui h1 { font-size: 14px; margin: 0 0 10px; letter-spacing: .14em; font-weight: 600; }
+  #ui h1 small { color: var(--muted); font-weight: 400; letter-spacing: .04em; margin-left: 6px; }
+  .row { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 8px 0; }
+  .row > span { font-size: 13px; color: var(--muted); min-width: 4.5em; }
+  .seg { display: flex; flex: 1; background: rgba(255, 255, 255, .06); border-radius: 10px; padding: 3px; gap: 3px; }
+  .seg button, .btn {
+    flex: 1; appearance: none; border: 0; border-radius: 8px; padding: 8px 4px;
+    background: transparent; color: var(--text); font: inherit; font-size: 13px; cursor: pointer;
+  }
+  .seg button[aria-pressed="true"] { background: var(--accent); color: #241a0e; font-weight: 600; }
+  .actions { display: flex; gap: 8px; margin-top: 10px; }
+  .btn { background: rgba(255, 255, 255, .08); padding: 9px 4px; }
+  .btn:active, .seg button:active { transform: scale(.97); }
+</style>
+</head>
+<body>
+<div id="stage">
+  <div id="screen">
+    <canvas id="cv" aria-label="雪の降る夜の街を窓から見たピクセルアート"></canvas>
+    <div id="hint">タップで設定</div>
+    <div id="ui" class="hidden" role="dialog" aria-label="設定">
+      <h1>雪の夜の窓<small>snowy night window</small></h1>
+      <div class="row"><span>雪</span>
+        <div class="seg" data-key="snow">
+          <button data-v="0">しんしん</button><button data-v="1">ふつう</button><button data-v="2">ふぶき</button>
+        </div>
+      </div>
+      <div class="row"><span>環境音</span>
+        <div class="seg" data-key="sound">
+          <button data-v="0">OFF</button><button data-v="1">ON</button>
+        </div>
+      </div>
+      <div class="actions">
+        <button class="btn" id="fs">全画面</button>
+        <button class="btn" id="close">とじる</button>
+      </div>
+    </div>
+  </div>
+</div>
+<script src="app.js"></script>
+</body>
+</html>
