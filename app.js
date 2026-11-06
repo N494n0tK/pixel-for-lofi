@@ -155,19 +155,27 @@
   CAT_TWITCH[1] = '..##......##.';
   CAT_TWITCH[2] = '..###...####.';
 
-  function catCanvas(rows) {
-    const w = rows[0].length, h = rows.length;
-    const L = new Layer(w, h);
-    const on = (x, y) => y >= 0 && y < h && x >= 0 && x < w && rows[y][x] === '#';
-    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
-      if (!on(x, y)) continue;
-      let c = '#16121c';
-      if (!on(x, y - 1)) c = '#4b5282';
-      else if (!on(x - 1, y) || !on(x + 1, y)) c = y < 9 ? '#353a62' : '#262a46';
-      L.px(x, y, c);
-    }
-    return L.canvas();
-  }
+  // ------------------------------------------------------------ materials（質感ごとの光り方）
+  // ks: つや（ハイライトの強さ） sh: ハイライトの鋭さ  refl: 窓の映り込み  blur: 映り込みのぼけ
+  // sheen: 逆光で縁が光る（布・毛）  wrap: 光の回り込み  aniso: 溝に沿った異方性の反射（レコード）
+  const MT = { PAINT: 1, FABRIC: 2, FLOOR: 3, WOOD: 4, METAL: 5, BRASS: 6, VINYL: 7, CERAMIC: 8, PAPER: 9, LEAF: 10, WAX: 11, RUG: 12, FUR: 13, LIQUID: 14, CLAY: 15 };
+  const MATS = {
+    [MT.PAINT]: { ks: 0.03, sh: 6 },
+    [MT.FABRIC]: { ks: 0, sheen: 0.08, wrap: 0.3 },
+    [MT.FLOOR]: { ks: 0.25, sh: 26, refl: 0.7, blur: 1 },
+    [MT.WOOD]: { ks: 0.18, sh: 18, refl: 0.45, blur: 2 },
+    [MT.METAL]: { ks: 0.5, sh: 34 },
+    [MT.BRASS]: { ks: 1.6, sh: 26, metal: true },
+    [MT.VINYL]: { ks: 1.0, aniso: 180 },
+    [MT.CERAMIC]: { ks: 1.2, sh: 70, refl: 0.35 },
+    [MT.PAPER]: { ks: 0.02, sh: 4, wrap: 0.2 },
+    [MT.LEAF]: { ks: 0.35, sh: 22, wrap: 0.3 },
+    [MT.WAX]: { ks: 0.06, sh: 8, wrap: 0.6 },
+    [MT.RUG]: { ks: 0, sheen: 0.03, wrap: 0.2 },
+    [MT.FUR]: { ks: 0, sheen: 0.9, wrap: 0.5 },
+    [MT.LIQUID]: { ks: 1.6, sh: 90, refl: 1.0 },
+    [MT.CLAY]: { ks: 0.05, sh: 8 },
+  };
 
   // ------------------------------------------------------------ settings
   const settings = { snow: 1, sound: 0 };
@@ -467,13 +475,34 @@
     });
 
     // ---------- room (一点透視の部屋)
+    // 壁面 (z=1) 上の座標 (x, y) と奥行き z から、世界座標は ((x-VPx), (y-VPy), FW*z)。
+    // 画面上の画素 (cx, cy) と z からは ((cx-VPx)*z, (cy-VPy)*z, FW*z)。
     const room = new Layer(W, H);
-    const FW = W * 1.3; // 奥行き方向のスケール
+    const FW = W * 1.3; // 奥行きのスケール（= 焦点距離）
     const shade = (c, k) => { const a = typeof c === 'string' ? C(c) : c; return [a[0] * k, a[1] * k, a[2] * k]; };
     const crosses = (a, b, n) => Math.floor(a / n) !== Math.floor(b / n);
     const cross = (a, b, q) => (b[0] - a[0]) * (q[1] - a[1]) - (b[1] - a[1]) * (q[0] - a[0]);
-    // 凸四角形を塗る（col は色 or (cx,cy)=>色）
-    const quad = (pts, col, alpha) => {
+    const nrm = (v) => { const l = Math.hypot(v[0], v[1], v[2]) || 1; return [v[0] / l, v[1] / l, v[2] / l]; };
+    const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+
+    // G バッファ: 画素ごとの奥行き・法線・素材（あとで光を計算するため）
+    const GZ = new Float32Array(W * H), GN = new Float32Array(W * H * 3), GM = new Uint8Array(W * H);
+    const gset = (x, y, z, n, m) => {
+      x = Math.floor(x); y = Math.floor(y);
+      if (x < 0 || y < 0 || x >= W || y >= H) return;
+      const i = y * W + x;
+      GZ[i] = z; GN[i * 3] = n[0]; GN[i * 3 + 1] = n[1]; GN[i * 3 + 2] = n[2]; GM[i] = m;
+    };
+    const put = (x, y, c, z, n, m) => { room.px(x, y, c); gset(x, y, z, n, m); };
+    // 光をさえぎる物（世界座標の箱）
+    const occ = [];
+    const ob = (x0, x1, y0, y1, z0, z1) => {
+      const b = { min: [x0 - VPx, y0 - VPy, FW * z0], max: [x1 - VPx, y1 - VPy, FW * z1] };
+      occ.push(b); return b;
+    };
+
+    // 凸四角形を塗る（col は色 or (cx,cy)=>色、pl はその面の平面と法線・素材）
+    const quad = (pts, col, alpha, pl) => {
       const fn = typeof col === 'function' ? col : () => col;
       const xs = pts.map((p) => p[0]), ys = pts.map((p) => p[1]);
       const x0 = Math.max(0, Math.floor(Math.min(...xs))), x1 = Math.min(W - 1, Math.ceil(Math.max(...xs)));
@@ -487,24 +516,53 @@
         }
         if (pos && neg) continue;
         const c = fn(q[0], q[1]);
-        if (c) room.px(x, y, c, alpha);
+        if (!c) continue;
+        room.px(x, y, c, alpha);
+        if (pl) {
+          const z = pl.a === 'z' ? pl.v : pl.a === 'y' ? (pl.v - VPy) / (q[1] - VPy) : (pl.v - VPx) / (q[0] - VPx);
+          gset(x, y, z, pl.n, pl.m);
+        }
       }
     };
     // 直方体（見える面だけ描く）
     const box = (b, col) => {
-      const { x0, x1, y0, y1, zf, zb } = b;
-      if (y0 > VPy) quad([PR(x0, y0, zb), PR(x1, y0, zb), PR(x1, y0, zf), PR(x0, y0, zf)], col.top);
-      if (y1 < VPy) quad([PR(x0, y1, zb), PR(x1, y1, zb), PR(x1, y1, zf), PR(x0, y1, zf)], col.side);
-      if (VPx < x0) quad([PR(x0, y0, zb), PR(x0, y0, zf), PR(x0, y1, zf), PR(x0, y1, zb)], col.side);
-      if (VPx > x1) quad([PR(x1, y0, zb), PR(x1, y0, zf), PR(x1, y1, zf), PR(x1, y1, zb)], col.side);
+      const { x0, x1, y0, y1, zf, zb } = b, m = col.m || MT.WOOD;
+      if (y0 > VPy) quad([PR(x0, y0, zb), PR(x1, y0, zb), PR(x1, y0, zf), PR(x0, y0, zf)], col.top, undefined, { a: 'y', v: y0, n: [0, -1, 0], m: col.mt || m });
+      if (y1 < VPy) quad([PR(x0, y1, zb), PR(x1, y1, zb), PR(x1, y1, zf), PR(x0, y1, zf)], col.side, undefined, { a: 'y', v: y1, n: [0, 1, 0], m });
+      if (VPx < x0) quad([PR(x0, y0, zb), PR(x0, y0, zf), PR(x0, y1, zf), PR(x0, y1, zb)], col.side, undefined, { a: 'x', v: x0, n: [-1, 0, 0], m });
+      if (VPx > x1) quad([PR(x1, y0, zb), PR(x1, y0, zf), PR(x1, y1, zf), PR(x1, y1, zb)], col.side, undefined, { a: 'x', v: x1, n: [1, 0, 0], m });
       const ft = PR(x0, y0, zf)[1];
       const front = typeof col.front === 'function' ? col.front : () => col.front;
       quad([PR(x0, y0, zf), PR(x1, y0, zf), PR(x1, y1, zf), PR(x0, y1, zf)],
-        (cx, cy) => (col.edge && cy - ft < 1 ? col.edge : front(cx, cy)));
+        (cx, cy) => (col.edge && cy - ft < 1 ? col.edge : front(cx, cy)), undefined, { a: 'z', v: zf, n: [0, 0, -1], m: col.mf || m });
+    };
+    // スプライト（円柱っぽい物として法線をつける）
+    const spriteG = (rows, map, mats, x, y, z, up = '') => {
+      sprite(room, rows, map, x, y);
+      for (let r = 0; r < rows.length; r++) {
+        const row = rows[r];
+        let a = -1, b = -1;
+        for (let c = 0; c < row.length; c++) if (row[c] !== '.') { if (a < 0) a = c; b = c; }
+        if (a < 0) continue;
+        const mid = (a + b + 1) / 2, hw = Math.max(1, (b - a + 1) / 2);
+        for (let c = a; c <= b; c++) {
+          const ch = row[c];
+          if (ch === '.' || !map[ch]) continue;
+          let n;
+          if (up.includes(ch)) n = [0, -1, 0];
+          else {
+            const u = clamp((c + 0.5 - mid) / hw, -0.92, 0.92);
+            const top = r === 0 || rows[r - 1][c] === '.' || rows[r - 1][c] === undefined;
+            n = nrm([u, top ? -0.6 : -0.1, -Math.sqrt(1 - u * u)]);
+          }
+          gset(x + c, y + r, z, n, mats[ch] || MT.PAINT);
+        }
+      }
     };
 
-    const WALL = '#211a2b', WALL_S = '#271f32';
+    const WALL = '#211a2b', WALL_S = '#271f32', PLASTER = '#4a4158';
     const ceilC = (cx, cy) => {
+      gset(cx, cy, (VPy - ceilY) / (VPy - cy), [0, 1, 0], MT.PAINT);
       const za = (VPy - ceilY) / (VPy - (cy - 0.5)), zb = (VPy - ceilY) / (VPy - (cy + 0.5));
       return crosses((1 - za) * FW, (1 - zb) * FW, 26) ? '#0d0a11' : '#16111c';
     };
@@ -513,23 +571,26 @@
       // rug
       const rx0 = W * 0.2, rx1 = W * 0.8, rd0 = FW * 0.07;
       if (xw >= rx0 && xw < rx1 && dep >= rd0) {
+        gset(cx, cy, z, [0, -1, 0], MT.RUG);
         const e = Math.min(xw - rx0, rx1 - xw, dep - rd0);
         if (e < 3) return '#c4a270';
         if (e < 4) return '#7a4a52';
         const dm = (Math.abs(xw - W / 2) + Math.abs(dep - FW * 0.3)) % 16;
         return dm < 2 ? '#b8946a' : dm < 5 ? '#7a3f50' : '#5c2f42';
       }
+      gset(cx, cy, z, [0, -1, 0], MT.FLOOR);
       const xa = VPx + (cx - 0.5 - VPx) * z, xb = VPx + (cx + 0.5 - VPx) * z;
       if (crosses(xa, xb, 9)) return '#1d1311';
       const p = Math.floor(xw / 9);
       const za = (floorY - VPy) / (cy - 0.5 - VPy), zb = (floorY - VPy) / (cy + 0.5 - VPy);
       const off = (((p * 37) % 50) + 50) % 50;
       if (crosses((1 - za) * FW + off, (1 - zb) * FW + off, 50)) return '#21160f';
-      const c = ['#3b2721', '#36231d', '#402b23', '#3a2620'][((p % 4) + 4) % 4];
-      return shade(c, 0.78 + 0.3 * clamp(dep / (FW * 0.25), 0, 1));
+      return ['#3b2721', '#36231d', '#402b23', '#3a2620'][((p % 4) + 4) % 4];
     };
     const backC = (cx, cy) => {
-      if (cy >= floorY - 3) return cy < floorY - 2 ? '#3a2e3a' : '#2b2130';
+      const base = cy >= floorY - 3;
+      gset(cx, cy, 1, [0, 0, -1], base ? MT.WOOD : MT.PAINT);
+      if (base) return cy < floorY - 2 ? '#3a2e3a' : '#2b2130';
       if (cy < ceilY + 2) return cy < ceilY + 1 ? '#352b3d' : '#2a2132';
       return Math.floor(cx) % 7 === 0 ? WALL_S : WALL;
     };
@@ -539,7 +600,8 @@
       const z = zOf(cx), yw = VPy + (cy - VPy) * z;
       if (yw < ceilY) return ceilC(cx, cy);
       if (yw >= floorY) return floorC(cx, cy);
-      const k = 0.72;
+      gset(cx, cy, z, [left ? 1 : -1, 0, 0], yw >= floorY - 3 ? MT.WOOD : MT.PAINT);
+      const k = 0.8;
       if (Math.abs(cx - (left ? L : RW)) < 1) return '#120d17';
       if (yw >= floorY - 3) return shade(yw < floorY - 2 ? '#3a2e3a' : '#2b2130', k);
       if (yw < ceilY + 2) return shade(yw < ceilY + 1 ? '#352b3d' : '#2a2132', k);
@@ -559,15 +621,13 @@
           if (cx > VPx) { const v = (O.x1 - VPx) / (cx - VPx); if (v < z) { z = v; face = 'r'; } }
           if (cy < VPy) { const v = (VPy - O.y0) / (VPy - cy); if (v < z) { z = v; face = 't'; } }
           if (cy > VPy) { const v = (O.y1 - VPy) / (cy - VPy); if (v < z) { z = v; face = 'b'; } }
-          const t = clamp((z - 1) / (ZW - 1), 0, 1);
-          if (face === 'l') c = mix('#33293f', '#6a6890', t * t);
-          else if (face === 'r') c = mix('#2a2236', '#4c4a72', t * t);
-          else if (face === 't') c = mix('#1a1424', '#3a3858', t * t);
-          else {
-            c = mix('#6a4636', '#8a6c62', t * t);
-            if (Math.floor(VPx + (cx - VPx) * z) % 23 === 0) c = shade(c, 0.86);
+          if (face === 'b') {
+            c = Math.floor(VPx + (cx - VPx) * z) % 23 === 0 ? '#5c3c2f' : '#6a4636';
+            gset(x, y, z, [0, -1, 0], MT.WOOD);
+          } else {
+            c = R() < 0.12 ? '#463d54' : PLASTER;
+            gset(x, y, z, face === 'l' ? [1, 0, 0] : face === 'r' ? [-1, 0, 0] : [0, 1, 0], MT.PAINT);
           }
-          if (face !== 'b' && (x === O.x0 || x === O.x1 - 1 || y === O.y0)) c = '#3d3249';
         } else if (cx < L || cx > RW) c = sideC(cx, cy);
         else if (cy < ceilY) c = ceilC(cx, cy);
         else if (cy >= floorY) c = floorC(cx, cy);
@@ -585,7 +645,7 @@
         else if (inPane(x, y - 1)) c = '#6e4636';
         else if (inPane(x, y + 1)) c = '#331f1b';
         else if (inPane(x - 1, y) || inPane(x + 1, y)) c = '#5a3a2f';
-        room.px(x, y, c);
+        put(x, y, c, ZW, [0, 0, -1], MT.WOOD);
       }
     }
 
@@ -595,7 +655,8 @@
       return Math.floor(VPx + (cx - VPx) * z) % 23 === 0 ? '#5c3c2f' : '#6a4636';
     };
     box({ x0: O.x0 - 3, x1: O.x1 + 3, y0: O.y1, y1: O.y1 + 4, zf: ZL, zb: 1 },
-      { top: seatTop, front: '#4a2e26', edge: '#9a6c52', side: '#3a241e' });
+      { top: seatTop, front: '#4a2e26', edge: '#9a6c52', side: '#3a241e', m: MT.WOOD });
+    ob(O.x0 - 3, O.x1 + 3, O.y1, O.y1 + 4, ZL, 1);
     {
       const yb = Math.ceil(PR(O.x0, O.y1 + 4, ZL)[1]);
       for (let i = 0; i < 6; i++) room.rect(O.x0 - 3, yb + i, O.x1 - O.x0 + 6, 1, '#000000', 0.42 * (1 - i / 6));
@@ -607,19 +668,20 @@
       if (ry1 - ry0 > 8) {
         const zf = 0.965;
         quad([PR(rx0 - 2, floorY, 1), PR(rx1 + 2, floorY, 1), PR(rx1 + 2, floorY, 0.93), PR(rx0 - 2, floorY, 0.93)], '#000000', 0.3);
-        const foot = { top: '#1c1724', front: '#1c1724', side: '#16121d' };
+        const foot = { top: '#1c1724', front: '#1c1724', side: '#16121d', m: MT.METAL };
         box({ x0: rx0 + 3, x1: rx0 + 5, y0: ry1, y1: floorY, zf: 0.972, zb: 0.985 }, foot);
         box({ x0: rx1 - 5, x1: rx1 - 3, y0: ry1, y1: floorY, zf: 0.972, zb: 0.985 }, foot);
         box({ x0: rx0, x1: rx1, y0: ry0, y1: ry1, zf, zb: 1 }, {
-          top: '#463e54', side: '#1c1724', edge: '#5a5168',
+          top: '#463e54', side: '#1c1724', edge: '#5a5168', m: MT.METAL,
           front: (cx, cy) => {
             const xw = VPx + (cx - VPx) * zf, yw = VPy + (cy - VPy) * zf;
             if (yw < ry0 + 2.5 || yw > ry1 - 2) return '#363044';
-            const m = (((Math.floor(xw - rx0)) % 3) + 3) % 3;
-            return m === 2 ? '#130f19' : m === 0 ? '#3a3247' : '#2c2638';
+            const mm = (((Math.floor(xw - rx0)) % 3) + 3) % 3;
+            return mm === 2 ? '#130f19' : mm === 0 ? '#3a3247' : '#2c2638';
           },
         });
-        box({ x0: rx0 - 5, x1: rx0, y0: ry0 + 4, y1: ry0 + 6, zf: 0.975, zb: 0.99 }, { top: '#5a516a', front: '#4a4258', side: '#2c2638' });
+        ob(rx0, rx1, ry0, ry1, zf, 1);
+        box({ x0: rx0 - 5, x1: rx0, y0: ry0 + 4, y1: ry0 + 6, zf: 0.975, zb: 0.99 }, { top: '#8a7a5a', front: '#6a5a42', side: '#4a3e2c', m: MT.BRASS });
       }
     }
 
@@ -637,14 +699,16 @@
         const w = cx - L;
         for (let x = L; x < cx; x++) {
           const u = (x - L) / w;
-          const fold = Math.sin(u * Math.PI * 5 + 0.4);
+          const ph = u * Math.PI * 5 + 0.4;
+          const fold = Math.sin(ph);
           let i = Math.round((fold * 0.5 + 0.5) * 2.6 + u * 1.4);
           if (x >= Math.floor(cx) - 1) i = 4;
           if (y < ytop + 2) i = 0;
           if (y > ybot - 2) i = Math.max(0, i - 1);
           const c = TONES[clamp(i, 0, 4)];
-          room.px(x, y, c);
-          room.px(W - 1 - x, y, c);
+          const nx = -Math.cos(ph) * 0.6 + (x >= Math.floor(cx) - 1 ? 0.7 : 0);
+          put(x, y, c, 0.975, nrm([nx, 0, -1]), MT.FABRIC);
+          put(W - 1 - x, y, c, 0.975, nrm([-nx, 0, -1]), MT.FABRIC);
         }
         // contact shadow
         for (let k = 0; k < 2; k++) {
@@ -653,21 +717,29 @@
         }
         if (Math.abs(y - yt) <= 1) {
           for (let x = L; x <= cx; x++) {
-            const c = y === yt ? '#8a6a34' : '#c09a52';
-            room.px(x, y, c); room.px(W - 1 - x, y, c);
+            const c = y === yt ? '#7a5a2c' : '#b08a48';
+            const n = nrm([0, y < yt ? -0.8 : y > yt ? 0.6 : 0, -1]);
+            put(x, y, c, 0.97, n, MT.BRASS); put(W - 1 - x, y, c, 0.97, n, MT.BRASS);
           }
         }
       }
-      room.rect(Math.round(K) - 1, yt + 2, 1, 3, '#c09a52');
-      room.rect(W - Math.round(K), yt + 2, 1, 3, '#c09a52');
+      for (let k = 0; k < 3; k++) {
+        put(Math.round(K) - 1, yt + 2 + k, '#b08a48', 0.97, [0, 0, -1], MT.BRASS);
+        put(W - Math.round(K), yt + 2 + k, '#b08a48', 0.97, [0, 0, -1], MT.BRASS);
+      }
     }
-    // rod
+    // rod (真鍮のカーテンレール)
     {
       const ry = O.y0 - 8;
-      room.rect(L + 1, ry, RW - L - 2, 2, '#6a4e36');
-      room.rect(L + 1, ry, RW - L - 2, 1, '#9a7652');
-      room.rect(L, ry - 1, 3, 4, '#a07c52');
-      room.rect(RW - 3, ry - 1, 3, 4, '#a07c52');
+      for (let x = L + 1; x < RW - 1; x++) {
+        put(x, ry, '#9a7652', 0.97, nrm([0, -1, -0.6]), MT.BRASS);
+        put(x, ry + 1, '#6a4e36', 0.97, nrm([0, 0.5, -1]), MT.BRASS);
+      }
+      for (let k = 0; k < 4; k++) for (let j = 0; j < 3; j++) {
+        const n = nrm([j - 1, k < 2 ? -0.7 : 0.4, -1]);
+        put(L + j, ry - 1 + k, '#a07c52', 0.965, n, MT.BRASS);
+        put(RW - 3 + j, ry - 1 + k, '#a07c52', 0.965, n, MT.BRASS);
+      }
       room.rect(L + 5, ry + 2, 1, 2, '#3a2a20');
       room.rect(RW - 6, ry + 2, 1, 2, '#3a2a20');
     }
@@ -694,47 +766,59 @@
     {
       const [x, y] = seat(O.x0 + 5, 1.07);
       objShadow(x + 1, y, PLANT[0].length);
-      sprite(room, PLANT, PLANT_MAP, x, y - PLANT.length);
+      spriteG(PLANT, PLANT_MAP, { g: MT.LEAF, G: MT.LEAF, r: MT.CLAY, p: MT.CLAY, q: MT.CLAY }, x, y - PLANT.length, 1.07);
+      ob(O.x0 + 6, O.x0 + 14, O.y1 - 12, O.y1, 1.05, 1.09);
     }
-    const [cdx, cdy] = seat(O.x0 + ow * 0.82, 1.06);
+    const cXw = O.x0 + ow * 0.82;
+    const [cdx, cdy] = seat(cXw, 1.06);
     objShadow(cdx - 2, cdy, CANDLE[0].length);
-    sprite(room, CANDLE, CANDLE_MAP, cdx - 2, cdy - CANDLE.length);
+    spriteG(CANDLE, CANDLE_MAP, { k: MT.PAINT, c: MT.WAX, C: MT.WAX, b: MT.BRASS }, cdx - 2, cdy - CANDLE.length, 1.06);
     s.candle = { x: cdx, y: cdy - CANDLE.length - 1 };
+    const candleBox = ob(cXw - 1.5, cXw + 1.5, O.y1 - 8, O.y1, 1.05, 1.07);
     // books
     box({ x0: O.x0 + 1, x1: O.x0 + 14, y0: O.y1 - 2, y1: O.y1, zf: 0.945, zb: 0.99 },
-      { top: '#3f5a7a', front: '#e6dcc4', side: '#2c4058', edge: '#4f6a8a' });
+      { top: '#3f5a7a', front: '#e6dcc4', side: '#2c4058', edge: '#4f6a8a', m: MT.PAPER });
     box({ x0: O.x0 + 2, x1: O.x0 + 12, y0: O.y1 - 4, y1: O.y1 - 2, zf: 0.952, zb: 0.982 },
-      { top: '#8a3e3e', front: '#d8ccb0', side: '#5e2a2a', edge: '#a04a48' });
+      { top: '#8a3e3e', front: '#d8ccb0', side: '#5e2a2a', edge: '#a04a48', m: MT.PAPER });
+    ob(O.x0 + 1, O.x0 + 14, O.y1 - 4, O.y1, 0.945, 0.99);
     {
-      const [x, y] = seat(O.x0 + ow * 0.62, 0.945);
+      const mXw = O.x0 + ow * 0.62;
+      const [x, y] = seat(mXw, 0.945);
       objShadow(x - 3, y, MUG[0].length - 1);
-      sprite(room, MUG, MUG_MAP, x - 3, y - MUG.length);
+      spriteG(MUG, MUG_MAP, { l: MT.CERAMIC, k: MT.LIQUID, w: MT.CERAMIC, h: MT.CERAMIC, r: MT.CERAMIC, s: MT.CLAY }, x - 3, y - MUG.length, 0.945, 'lk');
       s.mug = { x, y: y - MUG.length - 1 };
+      ob(mXw - 3.3, mXw + 3.3, O.y1 - 7, O.y1, 0.93, 0.96);
     }
+    let catBox;
     {
       const [x, y] = seat(O.x0 + ow * 0.36, 1.0);
       s.cat = { x: x - 6, y: y - CAT.length, bottom: y - 1 };
       room.rect(x - 7, y, 16, 1, '#000000', 0.3);
+      catBox = ob(x - 6, x + 7, O.y1 - CAT.length, O.y1, 0.985, 1.025);
     }
 
     // side table + record player (手前)
     s.record = null;
+    let vinylC = null;
     {
       const tyT = floorY - 26, tx0 = L - 8, tx1 = L + 44;
-      const leg = { top: '#2e1d17', front: '#3e271f', side: '#2a1a15' };
+      const leg = { top: '#2e1d17', front: '#3e271f', side: '#2a1a15', m: MT.WOOD };
       box({ x0: tx1 - 5, x1: tx1 - 2, y0: tyT + 3, y1: floorY, zf: 0.835, zb: 0.85 }, leg);
       box({ x0: tx0, x1: tx1, y0: tyT, y1: tyT + 3, zf: 0.66, zb: 0.86 }, {
         top: (cx, cy) => {
           const z = (tyT - VPy) / (cy - VPy), xw = VPx + (cx - VPx) * z;
           return Math.floor(xw) % 6 === 0 ? '#4e3226' : '#5a3a2c';
         },
-        front: '#3e271f', side: '#30201a', edge: '#7a5440',
+        front: '#3e271f', side: '#30201a', edge: '#7a5440', m: MT.WOOD,
       });
+      ob(tx0, tx1, tyT, tyT + 3, 0.66, 0.86);
       box({ x0: tx1 - 5, x1: tx1 - 2, y0: tyT + 3, y1: floorY, zf: 0.665, zb: 0.68 }, leg);
       const px0 = L + 11, px1 = L + 39, pz0 = 0.70, pz1 = 0.82, pyT = tyT - 4;
       box({ x0: px0, x1: px1, y0: pyT, y1: tyT, zf: pz0, zb: pz1 },
-        { top: '#3a3440', front: '#7a5236', side: '#5a3c28', edge: '#a07450' });
+        { top: '#2e2a34', front: '#7a5236', side: '#5a3c28', edge: '#a07450', m: MT.WOOD, mt: MT.METAL });
+      ob(px0, px1, pyT, tyT, pz0, pz1);
       const rcx = px0 + 13, rcz = 0.76, rr = 10.5;
+      vinylC = [rcx - VPx, pyT - VPy, FW * rcz];
       const label = [];
       const a0 = PR(px0, pyT, pz1), a1 = PR(px1, pyT, pz0);
       for (let y = Math.floor(a0[1]); y <= Math.ceil(a1[1]); y++) {
@@ -745,26 +829,295 @@
           const dx = xw - rcx, dz = (z - rcz) * FW, d = Math.hypot(dx, dz);
           if (d >= rr) continue;
           const a = Math.atan2(dz, dx);
-          let c;
-          if (d < 1) c = '#d8d8e0';
-          else if (d < 3.8) { c = '#b8463e'; label.push({ x, y, a }); }
-          else if (Math.abs(a - 2.4) < 0.3 || Math.abs(a + 0.75) < 0.3) c = '#3c3c4a';
-          else c = Math.floor(d * 1.3) % 2 ? '#18171d' : '#24232b';
-          room.px(x, y, c);
+          if (d < 1) put(x, y, '#d8d8e0', z, [0, -1, 0], MT.METAL);
+          else if (d < 3.8) { put(x, y, '#b8463e', z, [0, -1, 0], MT.PAPER); label.push({ x, y, a }); }
+          else put(x, y, Math.floor(d * 1.3) % 2 ? '#121116' : '#18171d', z, [0, -1, 0], MT.VINYL);
         }
       }
-      s.record = { label };
+      s.record = { label, c: vinylC, r: rr };
       // tone arm
       const p0 = PR(px1 - 3, pyT - 1, 0.805), p1 = PR(rcx + 7, pyT - 1, 0.735);
       const n = Math.ceil(Math.hypot(p1[0] - p0[0], p1[1] - p0[1]));
       for (let i = 0; i <= n; i++) {
-        room.px(lerp(p0[0], p1[0], i / n), lerp(p0[1], p1[1], i / n), '#c8c8d2');
+        const z = lerp(0.805, 0.735, i / n);
+        put(lerp(p0[0], p1[0], i / n), lerp(p0[1], p1[1], i / n), '#a8a8b2', z, nrm([0, -1, -0.4]), MT.BRASS);
       }
-      room.rect(Math.round(p0[0]) - 1, Math.round(p0[1]) - 1, 2, 2, '#8a8a98');
-      room.px(Math.round(p1[0]), Math.round(p1[1]), '#e8e8f0');
+      for (let k = 0; k < 4; k++) put(Math.round(p0[0]) - 1 + (k & 1), Math.round(p0[1]) - 1 + (k >> 1), '#6a6a78', 0.805, nrm([(k & 1) - 0.5, -1, -0.5]), MT.METAL);
+      put(Math.round(p1[0]), Math.round(p1[1]), '#d8d8e0', 0.735, [0, -1, 0], MT.METAL);
     }
 
-    // vignette（部屋の隅を暗く）
+    // ---------- lighting（光と影と反射の計算）
+    const LIN = new Float32Array(256);
+    for (let i = 0; i < 256; i++) LIN[i] = Math.pow(i / 255, 2.2);
+    const toS = (v) => 255 * Math.pow(v <= 0 ? 0 : v >= 1 ? 1 : v, 1 / 2.2);
+    const Pw = (cx, cy, z) => [(cx - VPx) * z, (cy - VPy) * z, FW * z];
+    const ZG = FW * ZW;
+    const OX0 = O.x0 - VPx, OX1 = O.x1 - VPx, OY0 = O.y0 - VPy, OY1 = O.y1 - VPy;
+    // 部屋側から窓の奥へ光が通るとき、壁の開口部を通るか
+    const throughO = (P, Q) => {
+      if ((P[2] - FW) * (Q[2] - FW) >= 0) return true;
+      const t = (FW - P[2]) / (Q[2] - P[2]);
+      const X = P[0] + (Q[0] - P[0]) * t, Y = P[1] + (Q[1] - P[1]) * t;
+      return X > OX0 && X < OX1 && Y > OY0 && Y < OY1;
+    };
+    const blocked = (P, Q, s1, s2) => {
+      for (const b of occ) {
+        if (b === s1 || b === s2) continue;
+        let t0 = 0.003, t1 = 0.997;
+        for (let k = 0; k < 3; k++) {
+          const d = Q[k] - P[k];
+          if (Math.abs(d) < 1e-9) { if (P[k] < b.min[k] || P[k] > b.max[k]) { t0 = 2; break; } continue; }
+          let ta = (b.min[k] - P[k]) / d, tb = (b.max[k] - P[k]) / d;
+          if (ta > tb) { const tmp = ta; ta = tb; tb = tmp; }
+          if (ta > t0) t0 = ta;
+          if (tb < t1) t1 = tb;
+          if (t0 > t1) break;
+        }
+        if (t0 <= t1) return true;
+      }
+      return false;
+    };
+
+    // 窓の外の景色（窓から入る光の色と、映り込みに使う）
+    const skyC = sky.canvas(), farC = far.canvas(), midC = mid.canvas(), stC = st.canvas();
+    const OL = new Float32Array(W * H * 3);
+    {
+      const oc = document.createElement('canvas'); oc.width = W; oc.height = H;
+      const o = oc.getContext('2d');
+      o.drawImage(skyC, 0, 0); o.drawImage(farC, 0, 0); o.drawImage(midC, 0, 0);
+      for (const w of s.wins) if (w.lit) { o.fillStyle = w.col; o.fillRect(w.x, w.y, 2, 3); }
+      for (const n of s.neons) { o.fillStyle = n.col; o.fillRect(n.x, n.y, 3, n.h); }
+      o.drawImage(stC, 0, 0);
+      o.fillStyle = '#d4dbf5'; o.fillRect(g.x0, g.y1 - 3, g.w, 3);
+      const d = o.getImageData(0, 0, W, H).data;
+      for (let i = 0; i < W * H; i++) { OL[i * 3] = LIN[d[i * 4]]; OL[i * 3 + 1] = LIN[d[i * 4 + 1]]; OL[i * 3 + 2] = LIN[d[i * 4 + 2]]; }
+    }
+    const blur = (src, r) => {
+      const a = new Float32Array(src.length), b = new Float32Array(src.length);
+      for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) for (let k = 0; k < 3; k++) {
+        let sum = 0, n = 0;
+        for (let i = -r; i <= r; i++) { const xx = x + i; if (xx >= 0 && xx < W) { sum += src[(y * W + xx) * 3 + k]; n++; } }
+        a[(y * W + x) * 3 + k] = sum / n;
+      }
+      for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) for (let k = 0; k < 3; k++) {
+        let sum = 0, n = 0;
+        for (let i = -r; i <= r; i++) { const yy = y + i; if (yy >= 0 && yy < H) { sum += a[(yy * W + x) * 3 + k]; n++; } }
+        b[(y * W + x) * 3 + k] = sum / n;
+      }
+      return b;
+    };
+    const OB = blur(OL, 1), OB2 = blur(OL, 4);
+
+    // 窓ガラスを小さな面光源の集まりとして扱う
+    const WS = [];
+    for (const p of panes) {
+      const pw = p.x1 - p.x0, ph = p.y1 - p.y0;
+      const nx = 2, ny = Math.max(1, Math.round(ph / 22));
+      for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) {
+        const sx0 = p.x0 + (pw * i) / nx, sx1 = p.x0 + (pw * (i + 1)) / nx;
+        const sy0 = p.y0 + (ph * j) / ny, sy1 = p.y0 + (ph * (j + 1)) / ny;
+        let r = 0, gg = 0, b = 0, n = 0;
+        for (let y = Math.floor(sy0); y < sy1; y++) for (let x = Math.floor(sx0); x < sx1; x++) {
+          const k = (y * W + x) * 3; r += OL[k]; gg += OL[k + 1]; b += OL[k + 2]; n++;
+        }
+        const scx = (sx0 + sx1) / 2, scy = (sy0 + sy1) / 2;
+        // 空の部分も雪明かりで少しだけ明るい
+        WS.push({ p: [(scx - VPx) * ZW, (scy - VPy) * ZW, ZG], L: [r / n + 0.004, gg / n + 0.005, b / n + 0.009], A: (sx1 - sx0) * (sy1 - sy0) * ZW * ZW });
+      }
+    }
+    // 窓の下半分（街の灯りと雪）の中心と平均の明るさ
+    const lower = WS.filter((w) => w.p[1] > (panes[2].y0 - VPy) * ZW);
+    const WC = [0, 0, 0], WCL = [0, 0, 0];
+    lower.forEach((w) => { for (let c = 0; c < 3; c++) { WC[c] += w.p[c] / lower.length; WCL[c] += w.L[c] / lower.length; } });
+    const KA = 12;
+    const KW = 3.2, KM = 0.55, KC = 950, KR = 2.0, KF = 0.18;
+    const LM = nrm([moon.x - VPx, moon.y - VPy, FW]);
+    const MOON = [0.55, 0.62, 0.85];
+    const CW = Pw(s.candle.x + 0.5, s.candle.y + 0.5, 1.06);
+    const CANDLE_C = [1.0, 0.52, 0.2];
+    const FAIRY = s.bulbs.map((b) => ({ p: Pw(b.x + 0.5, b.y + 0.5, 0.99), c: C(b.c).map((v) => LIN[v]) }));
+    const AMB = [0.7, 0.7, 0.8];
+
+    const moonVis = (P, s1) => {
+      const t = (ZG - P[2]) / LM[2];
+      if (t <= 0) return false;
+      const Q = [P[0] + LM[0] * t, P[1] + LM[1] * t, ZG];
+      if (!inPane(Math.floor(VPx + Q[0] / ZW), Math.floor(VPy + Q[1] / ZW))) return false;
+      return throughO(P, Q) && !blocked(P, Q, s1);
+    };
+
+    // 1点の明るさを計算する
+    //   E: 環境光+窓+月+電飾（拡散） S: つや・映り込み  CE/CS: ろうそくの分（ゆらぐので別に持つ）
+    const shadeP = (P, n, m, s1) => {
+      const mat = MATS[m] || MATS[MT.PAINT];
+      const D = nrm(P), V = [-D[0], -D[1], -D[2]];
+      const wrap = mat.wrap || 0;
+      const lam = (c) => (wrap ? Math.max(0, (c + wrap) / (1 + wrap)) : Math.max(0, c));
+      const rim = (Ld) => (mat.sheen ? mat.sheen * Math.pow(1 - Math.abs(dot(n, V)), 4) * Math.pow(Math.max(0, dot(Ld, D)), 2) : 0);
+      let tang = null;
+      if (m === MT.VINYL && vinylC) tang = nrm([-(P[2] - vinylC[2]), 0, P[0] - vinylC[0]]);
+      const spec = (Ld) => {
+        if (!mat.ks) return 0;
+        const Hh = nrm([Ld[0] + V[0], Ld[1] + V[1], Ld[2] + V[2]]);
+        if (tang) {
+          const th = dot(tang, Hh);
+          return mat.ks * Math.pow(Math.max(0, 1 - th * th), mat.aniso / 2) * Math.max(0, dot(n, Ld));
+        }
+        return mat.ks * Math.pow(Math.max(0, dot(n, Hh)), mat.sh) * (mat.sh + 8) / 60;
+      };
+      const E = AMB.slice(), S = [0, 0, 0], CE = [0, 0, 0], CS = [0, 0, 0];
+      let sheen = 0;
+      // 窓（面光源）
+      for (const w of WS) {
+        const d = [w.p[0] - P[0], w.p[1] - P[1], w.p[2] - P[2]];
+        const d2 = dot(d, d), dl = Math.sqrt(d2);
+        const Ld = [d[0] / dl, d[1] / dl, d[2] / dl];
+        const c1 = dot(n, Ld);
+        if (c1 <= -wrap && !mat.sheen) continue;
+        if (Ld[2] <= 0) continue;
+        if (!throughO(P, w.p) || blocked(P, w.p, s1)) continue;
+        const k = (KW * Ld[2] * w.A) / (d2 + 40);
+        const f = lam(c1), sp = (c1 > 0 ? spec(Ld) : 0) * (tang ? 0.15 : 1) + rim(Ld) * 1.6;
+        for (let c = 0; c < 3; c++) { E[c] += w.L[c] * k * f; S[c] += w.L[c] * k * sp; }
+      }
+      // レコードの溝に沿った帯状の光沢（窓の明るい下半分を主な光源とみなす）
+      if (tang) {
+        const Lw = nrm([WC[0] - P[0], WC[1] - P[1], WC[2] - P[2]]);
+        if (throughO(P, WC) && !blocked(P, WC, s1)) {
+          const sp = spec(Lw) * KA;
+          for (let c = 0; c < 3; c++) S[c] += WCL[c] * sp;
+          sheen += sp;
+        }
+      }
+      // 月（窓枠の影ができる平行光）
+      if ((dot(n, LM) > -wrap || mat.sheen) && moonVis(P, s1)) {
+        const c1 = dot(n, LM), f = lam(c1), sp = (c1 > 0 ? spec(LM) : 0) + rim(LM) * 0.5;
+        for (let c = 0; c < 3; c++) { E[c] += MOON[c] * KM * f; S[c] += MOON[c] * KM * sp; }
+        if (tang) sheen += KM * sp;
+      }
+      // 電飾（影は省略）
+      for (const b of FAIRY) {
+        const d = [b.p[0] - P[0], b.p[1] - P[1], b.p[2] - P[2]];
+        const d2 = dot(d, d), dl = Math.sqrt(d2);
+        const Ld = [d[0] / dl, d[1] / dl, d[2] / dl];
+        const c1 = dot(n, Ld);
+        if (c1 <= 0) continue;
+        if (!throughO(P, b.p)) continue;
+        const k = KF * 40 / (d2 + 40);
+        const sp = spec(Ld);
+        for (let c = 0; c < 3; c++) { E[c] += b.c[c] * k * lam(c1); S[c] += b.c[c] * k * sp * (mat.metal ? 5 : 1); }
+      }
+      // 窓の映り込み（鏡面反射。フレネルで浅い角度ほど強く映る）
+      if (mat.refl) {
+        const dn = dot(D, n);
+        const Rv = [D[0] - 2 * dn * n[0], D[1] - 2 * dn * n[1], D[2] - 2 * dn * n[2]];
+        if (Rv[2] > 1e-4) {
+          const t = (ZG - P[2]) / Rv[2];
+          const Q = [P[0] + Rv[0] * t, P[1] + Rv[1] * t, ZG];
+          if (throughO(P, Q) && !blocked(P, Q, s1)) {
+            const sx = Math.floor(VPx + Q[0] / ZW), sy = Math.floor(VPy + Q[1] / ZW);
+            let Lr = null;
+            if (inPane(sx, sy)) { const k = (sy * W + sx) * 3, src = mat.blur === 2 ? OB2 : mat.blur ? OB : OL; Lr = [src[k], src[k + 1], src[k + 2]]; }
+            else if (sx >= win.x0 && sx < win.x1 && sy >= win.y0 && sy < win.y1) Lr = [0.01, 0.005, 0.004];
+            if (Lr) {
+              const ct = Math.max(0, -dn), F = 0.04 + 0.96 * Math.pow(1 - ct, 5);
+              for (let c = 0; c < 3; c++) S[c] += Lr[c] * F * mat.refl * KR;
+            }
+          }
+        }
+      }
+      // ろうそく（点光源。物の影ができる）
+      {
+        const d = [CW[0] - P[0], CW[1] - P[1], CW[2] - P[2]];
+        const d2 = dot(d, d), dl = Math.sqrt(d2);
+        const Ld = [d[0] / dl, d[1] / dl, d[2] / dl];
+        const c1 = dot(n, Ld);
+        if ((c1 > -wrap || mat.sheen) && throughO(P, CW) && !blocked(P, CW, s1 || candleBox, candleBox)) {
+          const k = KC / (d2 + 160);
+          const f = lam(c1), sp = (c1 > 0 ? spec(Ld) : 0) + rim(Ld) * 0.6;
+          for (let c = 0; c < 3; c++) { CE[c] += CANDLE_C[c] * k * f; CS[c] += CANDLE_C[c] * k * sp; }
+          if (tang) sheen += k * sp * 0.5;
+        }
+        if (m === MT.WAX) {
+          const k = 2.2 / (1 + dl * 0.35);
+          CS[0] += 0.9 * k; CS[1] += 0.42 * k; CS[2] += 0.12 * k;
+        }
+      }
+      if (mat.metal) for (let c = 0; c < 3; c++) { S[c] *= 1; CS[c] *= 1; }
+      return { E, S, CE, CS, sheen, metal: !!mat.metal };
+    };
+
+    // 光の段階をディザで量子化して、ドット絵らしい階調にする
+    const qz = (v, step, b) => Math.max(0, Math.floor(v / step + b) * step);
+    const finish = (alb, r, b) => {
+      const st = [0, 0, 0], full = [0, 0, 0];
+      for (let c = 0; c < 3; c++) {
+        const tint = r.metal ? alb[c] * 6 : 1;
+        st[c] = alb[c] * qz(r.E[c], 0.14, b) + qz(r.S[c] * tint, 0.012, b);
+        full[c] = alb[c] * qz(r.E[c] + r.CE[c], 0.14, b) + qz((r.S[c] + r.CS[c]) * tint, 0.012, b);
+      }
+      return { st, full };
+    };
+
+    const cand = new Uint8ClampedArray(W * H * 4);
+    s.sheen = new Float32Array(W * H);
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        const i = y * W + x, z = GZ[i];
+        if (!z) continue;
+        const d = room.d, j = i * 4;
+        if (!d[j + 3]) continue;
+        const m = GM[i];
+        const n = [GN[i * 3], GN[i * 3 + 1], GN[i * 3 + 2]];
+        const P = Pw(x + 0.5, y + 0.5, z);
+        const alb = [LIN[d[j]], LIN[d[j + 1]], LIN[d[j + 2]]];
+        const r = shadeP(P, n, m, null);
+        const { st, full } = finish(alb, r, bay(x, y));
+        for (let c = 0; c < 3; c++) {
+          const a = toS(st[c]), f = toS(full[c]);
+          d[j + c] = a; cand[j + c] = Math.max(0, f - a);
+        }
+        cand[j + 3] = 255;
+        if (m === MT.VINYL) { s.sheen[i] = r.sheen; s.sheenMax = Math.max(s.sheenMax || 0, r.sheen); }
+      }
+    }
+
+    // 猫（逆光で縁が光る毛並み）
+    const litCat = (rows) => {
+      const w = rows[0].length, h = rows.length;
+      const A = new Layer(w, h), B = new Layer(w, h);
+      const on = (x, y) => y >= 0 && y < h && x >= 0 && x < w && rows[y][x] === '#';
+      const alb = C('#1d1824').map((v) => LIN[v]);
+      for (let y = 0; y < h; y++) {
+        let a = -1, b = -1;
+        for (let x = 0; x < w; x++) if (on(x, y)) { if (a < 0) a = x; b = x; }
+        for (let x = 0; x < w; x++) {
+          if (!on(x, y)) continue;
+          const u = clamp((x + 0.5 - (a + b + 1) / 2) / Math.max(1, (b - a + 1) / 2), -0.95, 0.95);
+          const top = !on(x, y - 1) ? -0.9 : y < 3 ? -0.4 : 0;
+          const n = nrm([u, top, -Math.sqrt(1 - u * u) * 0.8]);
+          const sx = s.cat.x + x + 0.5, sy = s.cat.y + y + 0.5;
+          const r = shadeP(Pw(sx, sy, 1.0), n, MT.FUR, catBox);
+          const { st, full } = finish(alb, r, bay(s.cat.x + x, s.cat.y + y));
+          const sa = st.map(toS), fa = full.map(toS);
+          A.px(x, y, sa);
+          B.px(x, y, [Math.max(0, fa[0] - sa[0]), Math.max(0, fa[1] - sa[1]), Math.max(0, fa[2] - sa[2])]);
+        }
+      }
+      return { st: A.canvas(), cd: B.canvas() };
+    };
+    const cat0 = litCat(CAT), cat1 = litCat(CAT_TWITCH);
+
+    // ガラスへの映り込み（ろうそくと電飾が、窓の奥に映る）
+    const mirror = (P) => { const z2 = 2 * ZG - P[2]; return [Math.round(VPx + (P[0] * FW) / z2), Math.round(VPy + (P[1] * FW) / z2)]; };
+    {
+      const [rx, ry] = mirror(CW);
+      s.candleRefl = { x: rx, y: ry };
+      s.bulbs.forEach((b, k) => { const [bx, by] = mirror(FAIRY[k].p); b.rx = bx; b.ry = by; });
+    }
+    s.VP = [VPx, VPy, FW];
+
+    // vignette（部屋の隅を少しだけ暗く）
     {
       const vx = VPx, vy = (O.y0 + O.y1) / 2;
       for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
@@ -772,22 +1125,27 @@
         if (!room.d[i + 3]) continue;
         const dx = (x - vx) / W, dy = (y - vy) / H;
         const d = Math.sqrt(dx * dx * 1.6 + dy * dy * 1.4);
-        const k = 1 - 0.42 * clamp((d - 0.32) / 0.45, 0, 1);
+        const k = 1 - 0.25 * clamp((d - 0.35) / 0.45, 0, 1);
         room.d[i] *= k; room.d[i + 1] *= k; room.d[i + 2] *= k;
       }
     }
 
-    // glow sprite (candle)
+    // glow sprite (candle の炎のまわりのにじみ)
     {
-      const r = 36, L = new Layer(r * 2 + 1, r * 2 + 1);
+      const r = 9, Lg = new Layer(r * 2 + 1, r * 2 + 1);
       for (let y = -r; y <= r; y++) for (let x = -r; x <= r; x++) {
-        const d = Math.hypot(x, y * 1.1);
+        const d = Math.hypot(x, y * 1.2);
         let a = 0;
-        if (d < 4) a = 0.24; else if (d < 9) a = 0.15; else if (d < 16) a = 0.09; else if (d < 25) a = 0.05; else if (d < 36) a = 0.025;
-        if (a) L.px(x + r, y + r, '#ff9a50', a);
+        if (d < 2) a = 0.3; else if (d < 4) a = 0.16; else if (d < 6.5) a = 0.08; else if (d < 9) a = 0.035;
+        if (a) Lg.px(x + r, y + r, '#ffa050', a);
       }
-      s.glowCandle = L.canvas(); s.glowCandleR = r;
+      s.glowCandle = Lg.canvas(); s.glowCandleR = r;
     }
+    s.Lroom = { room: room.canvas(), candle: (() => {
+      const c = document.createElement('canvas'); c.width = W; c.height = H;
+      c.getContext('2d').putImageData(new ImageData(cand, W, H), 0, 0); return c;
+    })(), cat: cat0, catTwitch: cat1, sky: skyC, far: farC, mid: midC, street: stC };
+
     // glow sprite (street lamp)
     {
       const r = 15, L = new Layer(r * 2 + 1, r * 2 + 1);
@@ -800,11 +1158,7 @@
       s.glowLamp = L.canvas(); s.glowLampR = r;
     }
 
-    s.L = {
-      sky: sky.canvas(), far: far.canvas(), mid: mid.canvas(), street: st.canvas(),
-      frost: fr.canvas(), room: room.canvas(),
-      cat: catCanvas(CAT), catTwitch: catCanvas(CAT_TWITCH),
-    };
+    s.L = Object.assign({ frost: fr.canvas() }, s.Lroom);
     S = s;
   }
 
@@ -1112,12 +1466,31 @@
     }
     ctx.globalAlpha = 1;
 
-    // ---- room
-    ctx.drawImage(L.room, 0, 0);
+    const fl = Math.min(1, 0.86 + Math.sin(t * 9.1) * 0.05 + Math.sin(t * 23.7) * 0.04 + Math.random() * 0.05);
 
-    const fl = 0.86 + Math.sin(t * 9.1) * 0.05 + Math.sin(t * 23.7) * 0.04 + Math.random() * 0.05;
+    // ガラスへの映り込み（ろうそくと電飾が窓の奥に映る。窓枠の外は部屋に隠れる）
+    ctx.globalCompositeOperation = 'lighter';
+    {
+      const r = S.candleRefl;
+      ctx.globalAlpha = 0.55 * fl;
+      ctx.drawImage(S.glowCandle, r.x - S.glowCandleR, r.y - S.glowCandleR);
+      ctx.globalAlpha = 0.5 * fl;
+      fill(r.x, r.y, 1, 1, '#ffc070');
+      fill(r.x, r.y - 1, 1, 1, '#ff9040');
+      for (const b of S.bulbs) {
+        const k = 0.5 + 0.5 * Math.sin(t * b.sp + b.ph);
+        ctx.globalAlpha = 0.12 + k * 0.3;
+        fill(b.rx, b.ry, 1, 1, b.c);
+      }
+    }
+    ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
+
+    // ---- room（ライティング済み）+ ろうそくの光（ゆらぎ）
+    ctx.drawImage(L.room, 0, 0);
     ctx.globalCompositeOperation = 'lighter';
     ctx.globalAlpha = fl;
+    ctx.drawImage(L.candle, 0, 0);
+    ctx.globalAlpha = 0.9 * fl;
     ctx.drawImage(S.glowCandle, S.candle.x - S.glowCandleR, S.candle.y - S.glowCandleR);
     // fairy lights
     for (const b of S.bulbs) {
@@ -1137,7 +1510,7 @@
 
     // candle flame
     const cx = S.candle.x, cy = S.candle.y;
-    const tall = fl > 0.92;
+    const tall = fl > 0.93;
     fill(cx, cy, 1, 1, '#fff3b8');
     fill(cx, cy - 1, 1, 1, '#ffb347');
     if (tall) fill(cx, cy - 2, 1, 1, '#ff8a3a');
@@ -1150,21 +1523,25 @@
     }
     ctx.globalAlpha = 1;
 
-    // cat
-    const cat = S.cat;
-    ctx.drawImage(t < twitchUntil ? L.catTwitch : L.cat, cat.x, cat.y);
+    // cat（逆光の縁取り + ろうそく側の暖かい光）
+    const cat = S.cat, cs = t < twitchUntil ? L.catTwitch : L.cat;
+    ctx.drawImage(cs.st, cat.x, cat.y);
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.globalAlpha = fl;
+    ctx.drawImage(cs.cd, cat.x, cat.y);
+    ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
     {
       const bx = cat.x + 11, by = cat.bottom - 1;
       fill(bx, by, 5, 2, '#16121c');
-      fill(bx, by, 5, 1, '#262a46');
+      fill(bx, by, 5, 1, '#3a2e3a');
       for (let k = 1; k <= 5; k++) {
         const sway = Math.round(Math.sin(t * 1.3 + k * 0.45) * k * 0.32);
-        fill(bx + 4 + sway, by - k, 1, 1, k === 5 ? '#4b5282' : '#16121c');
-        if (k <= 2) fill(bx + 5 + sway, by - k, 1, 1, '#262a46');
+        fill(bx + 4 + sway, by - k, 1, 1, k === 5 ? '#6a5a6e' : '#16121c');
+        if (k <= 3) { ctx.globalAlpha = 0.6 * fl; fill(bx + 5 + sway, by - k, 1, 1, '#8a5a40'); ctx.globalAlpha = 1; }
       }
     }
 
-    // record label spinning (33rpm)
+    // record: label spinning (33rpm) + 回転するホコリが光の帯でキラッと光る
     if (S.record) {
       const rot = (t * 3.46) % 6.2832;
       ctx.fillStyle = '#f0dcb0';
@@ -1172,6 +1549,14 @@
         const d = (((p.a - rot) % 6.2832) + 6.2832) % 6.2832;
         if (d < 0.8) ctx.fillRect(p.x, p.y, 1, 1);
       }
+      const [vx, vy, fw] = S.VP, c = S.record.c, rr = S.record.r;
+      for (const [k, a0] of [[0.55, 0.3], [0.82, 2.1], [0.4, 4.0], [0.7, 5.2], [0.9, 3.3]]) {
+        const a = a0 + rot, X = c[0] + rr * k * Math.cos(a), Z = c[2] + rr * k * Math.sin(a);
+        const sx = Math.floor(vx + (X * fw) / Z), sy = Math.floor(vy + (c[1] * fw) / Z);
+        const sh = (S.sheen[sy * W + sx] || 0) / (S.sheenMax || 1);
+        if (sh > 0.35) { ctx.globalAlpha = Math.min(1, (sh - 0.35) * 2.5); fill(sx, sy, 1, 1, '#ffffff'); }
+      }
+      ctx.globalAlpha = 1;
     }
   }
 
@@ -1370,5 +1755,5 @@
 
   layout();
   requestAnimationFrame(loop);
-  window.__snow = { get S() { return S; }, step: (n, dt = 1 / 30) => { for (let i = 0; i < n; i++) { t += dt; update(dt); } render(); } };
+  window.__snow = { get S() { return S; }, build: () => { const t0 = performance.now(); layout(); return performance.now() - t0; }, step: (n, dt = 1 / 30) => { for (let i = 0; i < n; i++) { t += dt; update(dt); } render(); } };
 })();

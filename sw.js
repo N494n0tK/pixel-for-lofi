@@ -1,5 +1,5 @@
 // オフライン用のシンプルなキャッシュ
-const CACHE = 'snowwin-v4';
+const CACHE = 'snowwin-v5';
 const FILES = ['./', './index.html', './app.js', './manifest.webmanifest',
   './icons/icon-192.png', './icons/icon-512.png', './icons/apple-touch-icon.png'];
 
